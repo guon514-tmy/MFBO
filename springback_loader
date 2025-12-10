@@ -1,0 +1,64 @@
+"""
+辅助函数：
+- load_mesh_vertices(csv_vertices) -> numpy (n_vert,3)
+- load_faces_and_rebounds(csv_faces) -> faces indices (n_face,3), face_rebound (n_face,)
+- face_centroids(vertices, faces) -> (n_face,3)
+- load_pointcloud(csv_pts) -> (n_pts,3), rebounds (n_pts,)
+
+- map_face_rebound_to_points: 将面片回弹转换为点（若需）：
+    - 方法1（推荐用于使两个 fidelity 共享坐标）：使用面重心作为低 fidelity 的样本点（centroids）
+    - 方法2（若要顶点值）：对每个顶点取相邻面回弹的平均值
+
+- build_common_query_points: 用实验点云的点（或两者合并并下采样）作为 MFNN 的空间查询点 X_test。
+"""
+import numpy as np
+import csv
+
+def load_vertices(csv_path):
+    # CSV columns: x,y,z
+    return np.loadtxt(csv_path, delimiter=',')  # shape (n_vert,3)
+
+def load_faces_and_rebounds(csv_path):
+    # CSV columns: i,j,k, rebound_value
+    data = np.loadtxt(csv_path, delimiter=',')
+    faces = data[:, :3].astype(int)
+    rebounds = data[:, 3]
+    return faces, rebounds
+
+def face_centroids(vertices, faces):
+    pts = vertices[faces]  # (n_face,3,3)
+    centroids = pts.mean(axis=1)
+    return centroids
+
+def load_pointcloud(csv_path):
+    # CSV columns: x,y,z, rebound
+    data = np.loadtxt(csv_path, delimiter=',')
+    pts = data[:, :3]
+    rebounds = data[:, 3]
+    return pts, rebounds
+
+def face_rebound_to_vertex_rebound(vertices, faces, face_rebounds):
+    # For each vertex, average rebounds of incident faces
+    n_vert = vertices.shape[0]
+    accum = np.zeros(n_vert)
+    counts = np.zeros(n_vert)
+    for f_idx, f in enumerate(faces):
+        for v in f:
+            accum[v] += face_rebounds[f_idx]
+            counts[v] += 1
+    counts[counts == 0] = 1.0
+    return accum / counts
+
+def build_common_points(sim_centroids, exp_points, method='exp'):
+    # method: 'exp' -> use experimental points as query (recommended)
+    # 'merge' -> concatenate centroids and exp points then unique/downsample
+    if method == 'exp':
+        return exp_points
+    elif method == 'merge':
+        pts = np.vstack([sim_centroids, exp_points])
+        # simple downsample unique by rounding
+        pts_rounded = np.round(pts, decimals=6)
+        _, idx = np.unique(pts_rounded, axis=0, return_index=True)
+        return pts[idx]
+    else:
+        return exp_points
