@@ -1,0 +1,227 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import norm
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C
+
+# --- 1. 模拟环境设置 ---
+
+class SimulatedStamping:
+    """
+    模拟冲压回弹过程，包含一个有偏差的仿真模型和一个真实的实验模型。
+    自变量 k (补偿系数)，因变量 Y (N个点的回弹量)。
+    """
+    def __init__(self, N_points=100):
+        self.N_points = N_points
+        # 真实回弹量的基础函数 (假设最优k=1.1时回弹量最小)
+        self.true_base_func = lambda k: 0.8 * (k - 1.1)**2 + 0.5
+
+    def true_experiment(self, k):
+        """模拟真实的冲压实验结果：昂贵、准确但包含随机测量误差。"""
+        # 1. 基础回弹形状 (真实回弹量)
+        base_rebound = self.true_base_func(k)
+        
+        # 2. 模拟N个点回弹量的分布 (假设形状为正弦波，峰值在base_rebound)
+        # 产生一个随k变化的回弹量场
+        x = np.linspace(0, 1, self.N_points)
+        field_shape = np.sin(2 * np.pi * x) * 0.2  # 形状波动
+        
+        # 3. 施加随机测量误差 (高斯噪声)
+        measurement_noise = np.random.normal(0, 0.05, self.N_points)
+        
+        # 最终真实回弹量场
+        E_k = base_rebound + field_shape * base_rebound + measurement_noise
+        return E_k
+
+    def simulation(self, k):
+        """模拟AutoForm仿真结果：廉价、快速但存在系统偏差 (Bias)。"""
+        # 1. 仿真通常会低估回弹量 (例如偏差始终为 0.3mm)
+        # 2. 仿真模型的形状可能不完美 (例如最优k在1.0而不是1.1)
+        sim_base_func = lambda k: 0.9 * (k - 1.0)**2 + 0.4
+        
+        # 3. 仿真结果
+        sim_rebound = sim_base_func(k)
+        
+        # 4. 模拟仿真场的分布 (与真实场形状略有不同)
+        x = np.linspace(0, 1, self.N_points)
+        sim_field_shape = np.cos(np.pi * x) * 0.15 
+
+        # 最终仿真回弹量场
+        S_k = sim_rebound + sim_field_shape * sim_rebound 
+        return S_k
+
+# --- 2. 标量化处理函数 ---
+
+def scalarize(Y, method='max', beta=1.0):
+    """
+    将高维回弹量场 Y (N个点的回弹量) 转化为一个标量值。
+    Args:
+        Y (np.array): 回弹量值数组。
+        method (str): 'max' (L-inf 范数) 或 'softmax' (平滑最大值)。
+        beta (float): Softmax的平滑度参数 (beta越大，越接近max)。
+    """
+    Y = np.abs(Y) # 回弹量通常只关注绝对值
+    if method == 'max':
+        return np.max(Y)
+    elif method == 'softmax':
+        # Softmax: log(sum(exp(beta * y_i))) / beta
+        # 这是一个平滑的最大值近似，更容易被GP拟合
+        return np.log(np.sum(np.exp(beta * Y))) / beta
+    else:
+        raise ValueError("Method must be 'max' or 'softmax'.")
+
+# --- 3. 贝叶斯优化核心组件 ---
+
+def ExpectedImprovement(k, mu_k, sigma_k, f_best):
+    """
+    计算采集函数：期望提升 (Expected Improvement, EI)。
+    """
+    # 确保方差不为0，避免数值错误
+    sigma_k = np.maximum(1e-10, sigma_k)
+    
+    Z = (f_best - mu_k) / sigma_k
+    ei = sigma_k * (Z * norm.cdf(Z) + norm.pdf(Z))
+    return ei
+
+def find_next_k_EI(K_candidates, GP_model, f_best):
+    """
+    在候选点中寻找最大化 EI 的点。
+    """
+    mu_candidates, sigma_candidates = GP_model.predict(K_candidates.reshape(-1, 1), return_std=True)
+    
+    # EI 函数需要标量输入，这里一次性计算所有候选点的EI
+    ei_values = ExpectedImprovement(K_candidates, mu_candidates, sigma_candidates, f_best)
+    
+    # 选出EI最大的那个k
+    next_k_index = np.argmax(ei_values)
+    return K_candidates[next_k_index]
+
+# --- 4. 偏差感知贝叶斯优化主流程 ---
+
+def delta_correction_bo(sim_env, initial_K, n_iterations, k_bounds=(0.7, 1.3)):
+    """
+    偏差校正贝叶斯优化主函数。
+    """
+    # 初始化数据记录
+    K_sim = []     # 仿真补偿系数
+    Y_sim = []     # 仿真标量回弹量 (廉价)
+    K_exp = initial_K.copy() # 实验补偿系数
+    Y_exp = []     # 实验标量回弹量 (昂贵)
+    
+    # 1. 生成初始的仿真数据 (密集采样)
+    K_sim = np.linspace(k_bounds[0], k_bounds[1], 50) 
+    for k in K_sim:
+        S_k = sim_env.simulation(k)
+        Y_sim.append(scalarize(S_k, method='softmax', beta=10))
+
+    Y_sim = np.array(Y_sim)
+    
+    # 2. 收集初始实验数据 (你的已知点)
+    for k in initial_K:
+        E_k = sim_env.true_experiment(k)
+        Y_exp.append(scalarize(E_k, method='softmax', beta=10))
+        
+    Y_exp = np.array(Y_exp)
+    
+    print(f"--- 初始数据 (n={len(initial_K)}) ---")
+    print(f"k: {initial_K}")
+    print(f"实验回弹: {Y_exp.round(3)}")
+    print("-" * 30)
+
+    # 3. 贝叶斯优化迭代
+    for i in range(n_iterations):
+        
+        # 3.1. 计算偏差 (Delta)
+        # 找到与实验 k 点最近的仿真 k 点（这里假设K_exp也在K_sim中，简化处理）
+        delta_y = []
+        for k_i, y_exp_i in zip(K_exp, Y_exp):
+            idx = np.argmin(np.abs(K_sim - k_i)) # 找到最接近的仿真点索引
+            y_sim_i = Y_sim[idx]
+            delta_y.append(y_exp_i - y_sim_i)
+            
+        delta_y = np.array(delta_y)
+        
+        # 3.2. 建立偏差模型 (高斯过程)
+        kernel = C(1.0, (1e-3, 1e3)) * RBF(1.0, (1e-2, 1e2))
+        gp_delta = GaussianProcessRegressor(kernel=kernel, alpha=1e-6, n_restarts_optimizer=10)
+        
+        # 训练 GP 模型来预测偏差
+        gp_delta.fit(K_exp.reshape(-1, 1), delta_y)
+        
+        # 3.3. 建立真实回弹预测模型
+        # 真实回弹 = 仿真 + 偏差预测
+        mu_delta, sigma_delta = gp_delta.predict(K_sim.reshape(-1, 1), return_std=True)
+        mu_real = Y_sim + mu_delta # 修正后的真实回弹预测均值
+        sigma_real = sigma_delta   # 预测真实回弹的不确定性主要来自偏差的不确定性
+
+        # 3.4. 寻找当前最佳观测值 (f_best)
+        # f_best是到目前为止所有实验点中的最小值
+        f_best = np.min(Y_exp) 
+        
+        # 3.5. 寻找下一个采样点 k_next
+        K_candidates = np.linspace(k_bounds[0], k_bounds[1], 100).reshape(-1, 1) # 候选点
+        k_next = find_next_k_EI(K_candidates, gp_delta, f_best)
+        
+        # 3.6. 执行下一轮实验 (模拟昂贵采样)
+        E_next = sim_env.true_experiment(k_next)
+        Y_next = scalarize(E_next, method='softmax', beta=10)
+        
+        # 3.7. 更新数据集
+        K_exp = np.append(K_exp, k_next)
+        Y_exp = np.append(Y_exp, Y_next)
+        
+        # 3.8. 结果汇报
+        print(f"迭代 {i+1}:")
+        print(f"  建议补偿系数 k_next = {k_next.round(4)}")
+        print(f"  真实回弹量 Y_next = {Y_next.round(4)}")
+        print(f"  当前最佳回弹量 f_best = {np.min(Y_exp).round(4)}")
+        if Y_next == f_best:
+            print("  🎉 找到新的最佳点!")
+        
+        # 绘图
+        plt.figure(figsize=(10, 6))
+        plt.plot(K_sim, Y_sim, 'b--', label='仿真预测 (S(k))')
+        plt.errorbar(K_exp, Y_exp, fmt='ro', capsize=5, label='真实实验数据 (E(k))')
+        plt.plot(K_sim, mu_real, 'g-', label='GP修正的真实预测 (S(k) + $\delta_{GP}$(k))')
+        
+        # 绘制不确定性区域
+        plt.fill_between(K_sim, mu_real - 1.96 * sigma_real, mu_real + 1.96 * sigma_real, 
+                         alpha=0.2, color='g', label='95% 置信区间')
+        
+        # 绘制下一个采样点
+        plt.axvline(x=k_next, color='gray', linestyle=':', label='下一个采样点 $k_{next}$')
+        
+        # 绘制目标阈值
+        threshold = 0.55 # 假设我们期望的回弹量阈值
+        plt.axhline(y=threshold, color='r', linestyle='--', label=f'目标阈值: {threshold}')
+
+        plt.title(f'迭代 {i+1}: 偏差感知贝叶斯优化')
+        plt.xlabel('回弹补偿系数 k')
+        plt.ylabel('最大回弹量 Y (mm)')
+        plt.legend()
+        plt.grid(True)
+        plt.show()
+        
+    return K_exp, Y_exp
+    
+# --- 5. 运行主程序 ---
+
+if __name__ == '__main__':
+    # 实例化模拟环境
+    stamping_env = SimulatedStamping(N_points=100)
+    
+    # 假设你已有的实验数据点 (不可变)
+    initial_K = np.array([0.8, 1.0, 1.2]) 
+    
+    # 设置迭代次数 (你只能做这么多次实验)
+    n_bo_iterations = 5 
+
+    # 运行贝叶斯优化
+    final_K, final_Y = delta_correction_bo(stamping_env, initial_K, n_bo_iterations)
+
+    print("\n--- 优化结果总结 ---")
+    best_index = np.argmin(final_Y)
+    print(f"总共进行的实验次数: {len(final_K)}")
+    print(f"最佳补偿系数 k*: {final_K[best_index].round(4)}")
+    print(f"对应的真实回弹量: {final_Y[best_index].round(4)} mm")
+    print("--------------------")
